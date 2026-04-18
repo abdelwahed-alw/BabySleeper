@@ -46,17 +46,13 @@ class _HomePageState extends State<HomePage> {
         channelDescription: 'Monitors audio levels in the background.',
         channelImportance: NotificationChannelImportance.DEFAULT,
         priority: NotificationPriority.DEFAULT,
-        iconData: const NotificationIconData(
-          resType: ResourceType.mipmap,
-          resPrefix: 'ic',
-          name: 'launcher',
-        ),
       ),
       iosNotificationOptions: const IOSNotificationOptions(
         showNotification: true,
         playSound: false,
       ),
       foregroundTaskOptions: ForegroundTaskOptions(
+        eventAction: ForegroundTaskEventAction.repeat(5000),
         autoRunOnBoot: false,
         allowWakeLock: true,
         allowWifiLock: true,

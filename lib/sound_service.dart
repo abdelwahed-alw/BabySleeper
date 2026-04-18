@@ -22,7 +22,7 @@ class SoundTaskHandler extends TaskHandler {
   double threshold = 70.0;
   String? audioFilePath;
 
-  Future<void> onStart(DateTime timestamp, SendPort? sendPort) async {
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
     // Read shared data
     final thresholdData = await FlutterForegroundTask.getData<double>(key: 'threshold');
     if (thresholdData != null) threshold = thresholdData;
@@ -85,19 +85,21 @@ class SoundTaskHandler extends TaskHandler {
     }
   }
 
-  Future<void> onRepeatEvent(DateTime timestamp, SendPort? sendPort) async {
-    // Optional: read new changes dynamically from shared preference if needed
-    // or just let it be. Wait, if threshold changed while running, we update it:
-    final th = await FlutterForegroundTask.getData<double>(key: 'threshold');
-    if (th != null) threshold = th;
+  @override
+  void onRepeatEvent(DateTime timestamp) {
+    // We cannot easily do async here without starting a microtask, but since getData returns
+    // a Future, we can handle it this way:
+    FlutterForegroundTask.getData<double>(key: 'threshold').then((th) {
+      if (th != null) threshold = th;
+    });
   }
 
-  Future<void> onDestroy(DateTime timestamp, SendPort? sendPort) async {
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
     _noiseSubscription?.cancel();
     _audioPlayer.dispose();
     try { await TorchLight.disableTorch(); } catch (_) {}
   }
   
-  Future<void> onEvent(DateTime timestamp, SendPort? sendPort) async {
+  void onReceiveData(Object data) {
   }
 }
