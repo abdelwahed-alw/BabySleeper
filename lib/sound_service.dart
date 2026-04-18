@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:isolate';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:noise_meter/noise_meter.dart';
 import 'package:torch_light/torch_light.dart';
@@ -21,7 +20,10 @@ class SoundTaskHandler extends TaskHandler {
   
   double threshold = 70.0;
   String? audioFilePath;
+  bool flashEnabled = true;
+  bool musicEnabled = true;
 
+  @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
     // Read shared data
     final thresholdData = await FlutterForegroundTask.getData<double>(key: 'threshold');
@@ -29,6 +31,12 @@ class SoundTaskHandler extends TaskHandler {
     
     final audioData = await FlutterForegroundTask.getData<String>(key: 'audioFilePath');
     if (audioData != null) audioFilePath = audioData;
+
+    final flashData = await FlutterForegroundTask.getData<bool>(key: 'flashEnabled');
+    if (flashData != null) flashEnabled = flashData;
+
+    final musicData = await FlutterForegroundTask.getData<bool>(key: 'musicEnabled');
+    if (musicData != null) musicEnabled = musicData;
 
     try {
       _noiseMeter = NoiseMeter();
@@ -60,46 +68,62 @@ class SoundTaskHandler extends TaskHandler {
     if (_isPlaying) return;
     _isPlaying = true;
     
-    try {
-      if (await TorchLight.isTorchAvailable()) {
-        await TorchLight.enableTorch();
-      }
-    } catch (_) {}
+    // Flash only if enabled
+    if (flashEnabled) {
+      try {
+        if (await TorchLight.isTorchAvailable()) {
+          await TorchLight.enableTorch();
+        }
+      } catch (_) {}
+    }
 
+    // Music only if enabled
     try {
-      if (audioFilePath != null && audioFilePath!.isNotEmpty) {
+      if (musicEnabled && audioFilePath != null && audioFilePath!.isNotEmpty) {
         await _audioPlayer.play(DeviceFileSource(audioFilePath!));
         _audioPlayer.onPlayerComplete.listen((_) async {
           _isPlaying = false;
-          try { await TorchLight.disableTorch(); } catch (_) {}
+          if (flashEnabled) {
+            try { await TorchLight.disableTorch(); } catch (_) {}
+          }
         });
       } else {
-        // Fallback if no audio file is selected 
+        // Fallback if no audio file is selected or music disabled
         await Future.delayed(const Duration(seconds: 3));
         _isPlaying = false;
-        try { await TorchLight.disableTorch(); } catch (_) {}
+        if (flashEnabled) {
+          try { await TorchLight.disableTorch(); } catch (_) {}
+        }
       }
     } catch (_) {
       _isPlaying = false;
-      try { await TorchLight.disableTorch(); } catch (_) {}
+      if (flashEnabled) {
+        try { await TorchLight.disableTorch(); } catch (_) {}
+      }
     }
   }
 
   @override
   void onRepeatEvent(DateTime timestamp) {
-    // We cannot easily do async here without starting a microtask, but since getData returns
-    // a Future, we can handle it this way:
     FlutterForegroundTask.getData<double>(key: 'threshold').then((th) {
       if (th != null) threshold = th;
     });
+    FlutterForegroundTask.getData<bool>(key: 'flashEnabled').then((v) {
+      if (v != null) flashEnabled = v;
+    });
+    FlutterForegroundTask.getData<bool>(key: 'musicEnabled').then((v) {
+      if (v != null) musicEnabled = v;
+    });
   }
 
+  @override
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
     _noiseSubscription?.cancel();
     _audioPlayer.dispose();
     try { await TorchLight.disableTorch(); } catch (_) {}
   }
   
+  @override
   void onReceiveData(Object data) {
   }
 }

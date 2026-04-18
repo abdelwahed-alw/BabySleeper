@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math';
 import 'dart:ui';
 import 'package:flutter/material.dart';
@@ -7,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:torch_light/torch_light.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:noise_meter/noise_meter.dart';
 import 'sound_service.dart';
 import 'painters.dart';
 
@@ -23,6 +25,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   bool _isServiceRunning = false;
   double _currentDb = 0.0;
 
+  // Feature toggles
+  bool _flashEnabled = true;
+  bool _musicEnabled = true;
+
+  // In-app noise monitoring
+  NoiseMeter? _noiseMeter;
+  StreamSubscription<NoiseReading>? _noiseSubscription;
+
   late AnimationController _starController;
   late AnimationController _pulseController;
   late AnimationController _meterGlowController;
@@ -32,6 +42,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     super.initState();
     _requestPermissions();
     _initForegroundTask();
+
+    // Listen for dB data sent from the background service
+    FlutterForegroundTask.addTaskDataCallback(_onReceiveTaskData);
+
+    // Start in-app noise monitoring for the dB meter
+    _startInAppListening();
 
     _starController = AnimationController(
       vsync: this,
@@ -49,8 +65,36 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     )..repeat(reverse: true);
   }
 
+  void _startInAppListening() {
+    try {
+      _noiseMeter = NoiseMeter();
+      _noiseSubscription = _noiseMeter!.noise.listen((NoiseReading reading) {
+        setState(() {
+          _currentDb = reading.meanDecibel;
+        });
+      });
+    } catch (e) {
+      debugPrint('Noise meter error: $e');
+    }
+  }
+
+  void _stopInAppListening() {
+    _noiseSubscription?.cancel();
+    _noiseSubscription = null;
+  }
+
+  void _onReceiveTaskData(Object data) {
+    if (data is double) {
+      setState(() {
+        _currentDb = data;
+      });
+    }
+  }
+
   @override
   void dispose() {
+    _stopInAppListening();
+    FlutterForegroundTask.removeTaskDataCallback(_onReceiveTaskData);
     _starController.dispose();
     _pulseController.dispose();
     _meterGlowController.dispose();
@@ -89,9 +133,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   void _startForegroundTask() async {
     await FlutterForegroundTask.saveData(key: 'threshold', value: _threshold);
+    await FlutterForegroundTask.saveData(key: 'flashEnabled', value: _flashEnabled);
+    await FlutterForegroundTask.saveData(key: 'musicEnabled', value: _musicEnabled);
     if (_audioFilePath != null) {
       await FlutterForegroundTask.saveData(key: 'audioFilePath', value: _audioFilePath!);
     }
+
+    // Stop in-app listening when background service takes over
+    _stopInAppListening();
 
     if (await FlutterForegroundTask.isRunningService) {
       FlutterForegroundTask.restartService();
@@ -107,7 +156,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   void _stopForegroundTask() async {
     await FlutterForegroundTask.stopService();
-    setState(() => _isServiceRunning = false);
+    setState(() {
+      _isServiceRunning = false;
+      _currentDb = 0.0;
+    });
+    // Resume in-app listening
+    _startInAppListening();
   }
 
   Future<void> _pickAudioFile() async {
@@ -126,21 +180,34 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Future<void> _testFlashAndSound() async {
-    try {
-      if (await TorchLight.isTorchAvailable()) {
-        await TorchLight.enableTorch();
-      }
-    } catch (_) {}
+    if (_flashEnabled) {
+      try {
+        if (await TorchLight.isTorchAvailable()) {
+          await TorchLight.enableTorch();
+        }
+      } catch (_) {}
+    }
 
-    if (_audioFilePath != null) {
+    if (_musicEnabled && _audioFilePath != null) {
       final player = AudioPlayer();
       await player.play(DeviceFileSource(_audioFilePath!));
       player.onPlayerComplete.listen((_) async {
-        try { await TorchLight.disableTorch(); } catch (_) {}
+        if (_flashEnabled) {
+          try { await TorchLight.disableTorch(); } catch (_) {}
+        }
       });
     } else {
       await Future.delayed(const Duration(seconds: 2));
-      try { await TorchLight.disableTorch(); } catch (_) {}
+      if (_flashEnabled) {
+        try { await TorchLight.disableTorch(); } catch (_) {}
+      }
+    }
+  }
+
+  void _syncToggles() {
+    if (_isServiceRunning) {
+      FlutterForegroundTask.saveData(key: 'flashEnabled', value: _flashEnabled);
+      FlutterForegroundTask.saveData(key: 'musicEnabled', value: _musicEnabled);
     }
   }
 
@@ -154,9 +221,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
               colors: [
-                Color(0xFFE8D5F5), // lavender top
-                Color(0xFFFFE0EC), // pink middle
-                Color(0xFFFFF0E6), // peach bottom
+                Color(0xFFE8D5F5),
+                Color(0xFFFFE0EC),
+                Color(0xFFFFF0E6),
               ],
               stops: [0.0, 0.5, 1.0],
             ),
@@ -164,7 +231,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           child: SafeArea(
             child: Stack(
               children: [
-                // Star field decorations
                 Positioned.fill(
                   child: AnimatedBuilder(
                     animation: _starController,
@@ -175,7 +241,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                     ),
                   ),
                 ),
-                // Main content
                 SingleChildScrollView(
                   padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
                   child: Column(
@@ -186,12 +251,24 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                       const SizedBox(height: 28),
                       _buildSensitivityCard(),
                       const SizedBox(height: 16),
+                      _buildFeatureTogglesCard(),
+                      const SizedBox(height: 16),
                       _buildLullabyCard(),
                       const SizedBox(height: 16),
                       _buildTestAlertButton(),
                       const SizedBox(height: 32),
                       _buildSafeModeToggle(),
                       const SizedBox(height: 24),
+                      Text(
+                        'Created by Abdelwahed Abdellaoui',
+                        style: GoogleFonts.nunito(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: const Color(0xFF9E9E9E),
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 16),
                     ],
                   ),
                 ),
@@ -206,10 +283,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   Widget _buildHeader() {
     return Column(
       children: [
-        Text(
-          '🌙',
-          style: const TextStyle(fontSize: 36),
-        ),
+        const Text('🌙', style: TextStyle(fontSize: 36)),
         const SizedBox(height: 4),
         Text(
           'Babysleeper',
@@ -249,7 +323,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         builder: (context, child) => Stack(
           alignment: Alignment.center,
           children: [
-            // Meter arc
             CustomPaint(
               size: const Size(200, 200),
               painter: SoundMeterPainter(
@@ -259,7 +332,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                 glowAnimation: _meterGlowController.value,
               ),
             ),
-            // Center content
             Column(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -389,6 +461,104 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
   }
 
+  Widget _buildFeatureTogglesCard() {
+    return _buildGlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Alert Options',
+            style: GoogleFonts.nunito(
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: const Color(0xFF5C3D8F),
+            ),
+          ),
+          const SizedBox(height: 8),
+          // Flash toggle
+          _buildToggleRow(
+            emoji: '🔦',
+            label: 'Flash Light',
+            subtitle: _flashEnabled ? 'Flash will blink on alert' : 'Flash disabled',
+            value: _flashEnabled,
+            activeColor: const Color(0xFFFFB74D),
+            onChanged: (val) {
+              setState(() => _flashEnabled = val);
+              _syncToggles();
+            },
+          ),
+          Divider(color: const Color(0xFFC9B1FF).withOpacity(0.2), height: 16),
+          // Music toggle
+          _buildToggleRow(
+            emoji: '🎶',
+            label: 'Lullaby Music',
+            subtitle: _musicEnabled ? 'Music will play on alert' : 'Music disabled',
+            value: _musicEnabled,
+            activeColor: const Color(0xFFFFB6C1),
+            onChanged: (val) {
+              setState(() => _musicEnabled = val);
+              _syncToggles();
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildToggleRow({
+    required String emoji,
+    required String label,
+    required String subtitle,
+    required bool value,
+    required Color activeColor,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return Row(
+      children: [
+        Container(
+          width: 40,
+          height: 40,
+          decoration: BoxDecoration(
+            color: value ? activeColor.withOpacity(0.2) : Colors.grey.withOpacity(0.1),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Center(child: Text(emoji, style: const TextStyle(fontSize: 20))),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: GoogleFonts.nunito(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: const Color(0xFF5C3D8F),
+                ),
+              ),
+              Text(
+                subtitle,
+                style: GoogleFonts.nunito(
+                  fontSize: 12,
+                  color: const Color(0xFF9E9E9E),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Switch(
+          value: value,
+          onChanged: onChanged,
+          activeColor: activeColor,
+          activeTrackColor: activeColor.withOpacity(0.3),
+          inactiveThumbColor: const Color(0xFFBDBDBD),
+          inactiveTrackColor: const Color(0xFFE0E0E0),
+        ),
+      ],
+    );
+  }
+
   Widget _buildLullabyCard() {
     return GestureDetector(
       onTap: _pickAudioFile,
@@ -490,7 +660,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   Widget _buildSafeModeToggle() {
     return Column(
       children: [
-        // Animated toggle button
         GestureDetector(
           onTap: () {
             if (_isServiceRunning) {
@@ -599,25 +768,21 @@ class _StarThumbShape extends SliderComponentShape {
   }) {
     final canvas = context.canvas;
 
-    // Outer glow
     final glowPaint = Paint()
       ..color = const Color(0xFFC9B1FF).withOpacity(0.3)
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6);
     canvas.drawCircle(center, 14, glowPaint);
 
-    // White circle base
     final basePaint = Paint()
       ..color = const Color(0xFFFFF8E7)
       ..style = PaintingStyle.fill;
     canvas.drawCircle(center, 11, basePaint);
 
-    // Star icon
     final starPaint = Paint()
       ..color = const Color(0xFFC9B1FF)
       ..style = PaintingStyle.fill;
     _drawStar(canvas, center, 7, starPaint);
 
-    // Border
     final borderPaint = Paint()
       ..color = const Color(0xFFC9B1FF).withOpacity(0.5)
       ..style = PaintingStyle.stroke
