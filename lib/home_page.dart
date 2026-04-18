@@ -29,6 +29,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   bool _flashEnabled = true;
   bool _musicEnabled = true;
 
+  // Lullaby config
+  double _lullabyVolume = 1.0;
+  AudioPlayer? _localAudioPlayer;
+
+  DateTime? _firstExceedTime;
+  DateTime? _lastExceedTime;
+  bool _isAlarmPlaying = false;
+
   // In-app noise monitoring
   NoiseMeter? _noiseMeter;
   StreamSubscription<NoiseReading>? _noiseSubscription;
@@ -42,9 +50,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     super.initState();
     _requestPermissions();
     _initForegroundTask();
-
-    // Listen for dB data sent from the background service
-    FlutterForegroundTask.addTaskDataCallback(_onReceiveTaskData);
 
     // Start in-app noise monitoring for the dB meter
     _startInAppListening();
@@ -72,6 +77,27 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         setState(() {
           _currentDb = reading.meanDecibel;
         });
+
+        // Alarm logic directly in main isolate while safe mode is ON
+        if (_isServiceRunning) {
+          if (reading.meanDecibel >= _threshold) {
+             if (_firstExceedTime == null) {
+                _firstExceedTime = DateTime.now();
+             }
+             _lastExceedTime = DateTime.now();
+
+             if (DateTime.now().difference(_firstExceedTime!).inSeconds >= 2) {
+               _fireAlarm();
+               _firstExceedTime = null;
+               _lastExceedTime = null;
+             }
+          } else {
+             if (_lastExceedTime != null && DateTime.now().difference(_lastExceedTime!).inSeconds >= 1) {
+                _firstExceedTime = null;
+                _lastExceedTime = null;
+             }
+          }
+        }
       });
     } catch (e) {
       debugPrint('Noise meter error: $e');
@@ -83,18 +109,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     _noiseSubscription = null;
   }
 
-  void _onReceiveTaskData(Object data) {
-    if (data is double) {
-      setState(() {
-        _currentDb = data;
-      });
-    }
-  }
-
   @override
   void dispose() {
     _stopInAppListening();
-    FlutterForegroundTask.removeTaskDataCallback(_onReceiveTaskData);
     _starController.dispose();
     _pulseController.dispose();
     _meterGlowController.dispose();
@@ -132,16 +149,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   void _startForegroundTask() async {
-    await FlutterForegroundTask.saveData(key: 'threshold', value: _threshold);
-    await FlutterForegroundTask.saveData(key: 'flashEnabled', value: _flashEnabled);
-    await FlutterForegroundTask.saveData(key: 'musicEnabled', value: _musicEnabled);
-    if (_audioFilePath != null) {
-      await FlutterForegroundTask.saveData(key: 'audioFilePath', value: _audioFilePath!);
-    }
-
-    // Stop in-app listening when background service takes over
-    _stopInAppListening();
-
     if (await FlutterForegroundTask.isRunningService) {
       FlutterForegroundTask.restartService();
     } else {
@@ -158,10 +165,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     await FlutterForegroundTask.stopService();
     setState(() {
       _isServiceRunning = false;
-      _currentDb = 0.0;
     });
-    // Resume in-app listening
-    _startInAppListening();
+    _stopAlert();
+    _firstExceedTime = null;
+    _lastExceedTime = null;
   }
 
   Future<void> _pickAudioFile() async {
@@ -180,6 +187,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Future<void> _testFlashAndSound() async {
+    _fireAlarm();
+  }
+
+  Future<void> _fireAlarm() async {
+    if (_isAlarmPlaying) return;
+    _isAlarmPlaying = true;
+    _stopAlert(); // Stop any currently playing alert first
+
     if (_flashEnabled) {
       try {
         if (await TorchLight.isTorchAvailable()) {
@@ -189,25 +204,27 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     }
 
     if (_musicEnabled && _audioFilePath != null) {
-      final player = AudioPlayer();
-      await player.play(DeviceFileSource(_audioFilePath!));
-      player.onPlayerComplete.listen((_) async {
-        if (_flashEnabled) {
-          try { await TorchLight.disableTorch(); } catch (_) {}
-        }
-      });
+      _localAudioPlayer = AudioPlayer();
+      await _localAudioPlayer!.setVolume(_lullabyVolume);
+      await _localAudioPlayer!.setReleaseMode(ReleaseMode.loop);
+      await _localAudioPlayer!.play(DeviceFileSource(_audioFilePath!));
+      // It loops infinitely, so we don't clear the alarm until user clicks Stop
     } else {
-      await Future.delayed(const Duration(seconds: 2));
-      if (_flashEnabled) {
-        try { await TorchLight.disableTorch(); } catch (_) {}
-      }
+      // Just keep playing indefinitely without music (flash only)
     }
+  }
+
+  Future<void> _stopAlert() async {
+    try { await _localAudioPlayer?.stop(); } catch (_) {}
+    try { await TorchLight.disableTorch(); } catch (_) {}
+    _isAlarmPlaying = false;
   }
 
   void _syncToggles() {
     if (_isServiceRunning) {
       FlutterForegroundTask.saveData(key: 'flashEnabled', value: _flashEnabled);
       FlutterForegroundTask.saveData(key: 'musicEnabled', value: _musicEnabled);
+      FlutterForegroundTask.saveData(key: 'lullabyVolume', value: _lullabyVolume);
     }
   }
 
@@ -255,7 +272,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                       const SizedBox(height: 16),
                       _buildLullabyCard(),
                       const SizedBox(height: 16),
-                      _buildTestAlertButton(),
+                      _buildVolumeCard(),
+                      const SizedBox(height: 16),
+                      _buildAlertButtonsRow(),
                       const SizedBox(height: 32),
                       _buildSafeModeToggle(),
                       const SizedBox(height: 24),
@@ -620,40 +639,147 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
   }
 
-  Widget _buildTestAlertButton() {
-    return GestureDetector(
-      onTap: _testFlashAndSound,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 14),
-        decoration: BoxDecoration(
-          gradient: const LinearGradient(
-            colors: [Color(0xFFC9B1FF), Color(0xFFFFB6C1)],
+  Widget _buildVolumeCard() {
+    return _buildGlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  const Text('🔈', style: TextStyle(fontSize: 20)),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Lullaby Volume',
+                    style: GoogleFonts.nunito(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: const Color(0xFF5C3D8F),
+                    ),
+                  ),
+                ],
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFFB6C1).withOpacity(0.25),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  '${(_lullabyVolume * 100).toInt()}%',
+                  style: GoogleFonts.nunito(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                    color: const Color(0xFF5C3D8F),
+                  ),
+                ),
+              ),
+            ],
           ),
-          borderRadius: BorderRadius.circular(50),
-          boxShadow: [
-            BoxShadow(
-              color: const Color(0xFFC9B1FF).withOpacity(0.35),
-              blurRadius: 16,
-              offset: const Offset(0, 6),
+          const SizedBox(height: 8),
+          SliderTheme(
+            data: SliderThemeData(
+              trackHeight: 8,
+              activeTrackColor: const Color(0xFFFFB6C1),
+              inactiveTrackColor: const Color(0xFFFFB6C1).withOpacity(0.2),
+              thumbColor: const Color(0xFFFFF8E7),
+              thumbShape: const _StarThumbShape(),
+              overlayColor: const Color(0xFFFFB6C1).withOpacity(0.2),
+              overlayShape: const RoundSliderOverlayShape(overlayRadius: 24),
             ),
-          ],
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('✨', style: TextStyle(fontSize: 18)),
-            const SizedBox(width: 8),
-            Text(
-              'Test Alert',
-              style: GoogleFonts.nunito(
-                fontSize: 16,
-                fontWeight: FontWeight.w700,
-                color: Colors.white,
+            child: Slider(
+              value: _lullabyVolume,
+              min: 0.0,
+              max: 1.0,
+              onChanged: (value) {
+                setState(() => _lullabyVolume = value);
+                _syncToggles();
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAlertButtonsRow() {
+    return Row(
+      children: [
+        Expanded(
+          child: GestureDetector(
+            onTap: _testFlashAndSound,
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFFC9B1FF), Color(0xFFFFB6C1)],
+                ),
+                borderRadius: BorderRadius.circular(50),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFFC9B1FF).withOpacity(0.35),
+                    blurRadius: 16,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Text('✨', style: TextStyle(fontSize: 18)),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Test Alert',
+                    style: GoogleFonts.nunito(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
               ),
             ),
-          ],
+          ),
         ),
-      ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: GestureDetector(
+            onTap: _stopAlert,
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.8),
+                borderRadius: BorderRadius.circular(50),
+                border: Border.all(color: const Color(0xFFFFB6C1), width: 1.5),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFFFFB6C1).withOpacity(0.15),
+                    blurRadius: 16,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Text('🛑', style: TextStyle(fontSize: 18)),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Stop Alert',
+                    style: GoogleFonts.nunito(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: const Color(0xFFFFB6C1),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 

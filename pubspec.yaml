@@ -93,14 +93,12 @@ flutter:
   #       - asset: fonts/TrajanPro_Bold.ttf
   #         weight: 700
   #
-  # For details regarding fonts from package dependencies,
-  # see https://flutter.dev/to/font-from-package
-
   assets:
     - assets/icon.png
+    - assets/icon_circle.png
 
 flutter_launcher_icons:
   android: "ic_launcher"
   ios: true
-  image_path: "assets/icon.png"
+  image_path: "assets/icon_circle.png"
   min_sdk_android: 21
