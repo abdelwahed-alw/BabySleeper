@@ -36,6 +36,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   DateTime? _firstExceedTime;
   DateTime? _lastExceedTime;
   bool _isAlarmPlaying = false;
+  Timer? _autoStopTimer;
 
   // In-app noise monitoring
   NoiseMeter? _noiseMeter;
@@ -98,9 +99,22 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
              }
           }
         }
-      });
+      },
+      onError: (Object error) {
+        debugPrint('Noise meter stream error: $error');
+        _stopInAppListening();
+        // Automatically try to restart listening after a delay
+        Future.delayed(const Duration(seconds: 2), () {
+          if (mounted) _startInAppListening();
+        });
+      },
+      cancelOnError: true,
+      );
     } catch (e) {
-      debugPrint('Noise meter error: $e');
+      debugPrint('Noise meter init error: $e');
+      Future.delayed(const Duration(seconds: 2), () {
+        if (mounted) _startInAppListening();
+      });
     }
   }
 
@@ -111,6 +125,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    _autoStopTimer?.cancel();
     _stopInAppListening();
     _starController.dispose();
     _pulseController.dispose();
@@ -159,9 +174,19 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       );
     }
     setState(() => _isServiceRunning = true);
+
+    // Auto-stop the Safe Mode after exactly 1 hour
+    _autoStopTimer?.cancel();
+    _autoStopTimer = Timer(const Duration(hours: 1), () {
+      if (mounted && _isServiceRunning) {
+        _stopForegroundTask();
+      }
+    });
   }
 
   void _stopForegroundTask() async {
+    _autoStopTimer?.cancel();
+    _autoStopTimer = null;
     await FlutterForegroundTask.stopService();
     setState(() {
       _isServiceRunning = false;
@@ -193,8 +218,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   Future<void> _fireAlarm() async {
     if (_isAlarmPlaying) return;
     _isAlarmPlaying = true;
-    _stopAlert(); // Stop any currently playing alert first
 
+    // Stop the mic so the alarm sound cannot create a feedback loop
+    _stopInAppListening();
+
+    // Cleanly release any previous audio player without touching the torch
+    try { await _localAudioPlayer?.stop(); } catch (_) {}
+
+    // Turn on flash and keep it on — it will only turn off in _stopAlert()
     if (_flashEnabled) {
       try {
         if (await TorchLight.isTorchAvailable()) {
@@ -203,21 +234,25 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       } catch (_) {}
     }
 
+    // Play looping music
     if (_musicEnabled && _audioFilePath != null) {
       _localAudioPlayer = AudioPlayer();
-      await _localAudioPlayer!.setVolume(_lullabyVolume);
+      // _lullabyVolume is 0.0–1.0
+      await _localAudioPlayer!.setVolume(_lullabyVolume.clamp(0.0, 1.0));
       await _localAudioPlayer!.setReleaseMode(ReleaseMode.loop);
       await _localAudioPlayer!.play(DeviceFileSource(_audioFilePath!));
-      // It loops infinitely, so we don't clear the alarm until user clicks Stop
-    } else {
-      // Just keep playing indefinitely without music (flash only)
     }
+    // Flash and/or music will keep going until _stopAlert() is called
   }
 
   Future<void> _stopAlert() async {
     try { await _localAudioPlayer?.stop(); } catch (_) {}
     try { await TorchLight.disableTorch(); } catch (_) {}
     _isAlarmPlaying = false;
+    // Restart the microphone after stopping the alarm
+    if (_isServiceRunning && _noiseSubscription == null) {
+      _startInAppListening();
+    }
   }
 
   void _syncToggles() {
