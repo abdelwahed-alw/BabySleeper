@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -9,6 +10,7 @@ import 'package:torch_light/torch_light.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:noise_meter/noise_meter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'sound_service.dart';
 import 'painters.dart';
 
@@ -51,6 +53,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     super.initState();
     _requestPermissions();
     _initForegroundTask();
+    _loadSavedAudioFile();
 
     // Start in-app noise monitoring for the dB meter
     _startInAppListening();
@@ -196,6 +199,16 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     _lastExceedTime = null;
   }
 
+  Future<void> _loadSavedAudioFile() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedPath = prefs.getString('savedAudioFilePath');
+    if (savedPath != null && savedPath.isNotEmpty) {
+      setState(() {
+        _audioFilePath = savedPath;
+      });
+    }
+  }
+
   Future<void> _pickAudioFile() async {
     FilePickerResult? result = await FilePicker.pickFiles(
       type: FileType.audio,
@@ -205,9 +218,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       setState(() {
         _audioFilePath = result.files.single.path;
       });
-      if (_isServiceRunning) {
-        FlutterForegroundTask.saveData(key: 'audioFilePath', value: _audioFilePath!);
-      }
+      // Save to persistent storage so the app remembers it
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('savedAudioFilePath', _audioFilePath!);
     }
   }
 
@@ -234,9 +247,26 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       } catch (_) {}
     }
 
-    // Play looping music
+    // Play looping music using the ALARM stream (ignores phone silent mode)
     if (_musicEnabled && _audioFilePath != null) {
+      // Force Android alarm stream to max — only the in-app slider controls volume
+      try {
+        const platform = MethodChannel('com.alw.babysleeper/volume');
+        await platform.invokeMethod('setAlarmVolumeMax');
+      } catch (_) {}
+
       _localAudioPlayer = AudioPlayer();
+      await _localAudioPlayer!.setAudioContext(AudioContext(
+        android: const AudioContextAndroid(
+          usageType: AndroidUsageType.alarm,
+          contentType: AndroidContentType.music,
+          audioFocus: AndroidAudioFocus.gainTransientMayDuck,
+        ),
+        iOS: AudioContextIOS(
+          category: AVAudioSessionCategory.playback,
+          options: {AVAudioSessionOptions.duckOthers},
+        ),
+      ));
       // _lullabyVolume is 0.0–1.0
       await _localAudioPlayer!.setVolume(_lullabyVolume.clamp(0.0, 1.0));
       await _localAudioPlayer!.setReleaseMode(ReleaseMode.loop);
